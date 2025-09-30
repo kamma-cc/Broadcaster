@@ -1,0 +1,12 @@
+# IDE
+.idea/
+
+# Build directories
+build/
+cmake-build-*/
+
+# Compiled files
+*.o
+*.so
+*.a
+broadcaster
