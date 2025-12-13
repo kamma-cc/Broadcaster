@@ -8,15 +8,25 @@ Broadcaster is a high-performance network broadcast service built with io_uring,
 
 ## Current Status
 
-**Phase 1 Complete**: Basic io_uring TCP server implementation
+**Phase 2 Complete**: RAII resource encapsulation with Hello World server
 - ✅ io_uring initialization and event loop
 - ✅ TCP socket setup and listening
 - ✅ Asynchronous accept using IORING_OP_ACCEPT
-- ✅ Basic connection handling
+- ✅ Asynchronous send using IORING_OP_SEND
+- ✅ Asynchronous close using IORING_OP_CLOSE
+- ✅ RAII wrappers for FileDescriptor, Socket, IoUring
 
-**Current Phase**: RAII resource encapsulation
-- **Next**: Encapsulate Linux network programming resources (Socket, IoUring) using C++ RAII patterns
-- **Future**: Implement multishot operations (accept, recv), provided buffers, zero-copy features
+**Current Implementation** (src/main.cpp):
+- `FileDescriptor` class: Generic fd wrapper (non-copyable, movable)
+- `Socket` class: TCP socket with `create_listener()` factory method
+- `IoUring` class: io_uring ring wrapper (non-copyable, non-movable)
+- Simple "Hello, World!" TCP server for testing
+
+**Next Phase**: Production features
+- Implement multishot accept for efficient connection handling
+- Add receive operations (IORING_OP_RECV)
+- Buffer management with provided buffers
+- Zero-copy optimizations
 
 **Protocol Design**: COBS encoding documented in PROTOCOL_DESIGN.md
 
@@ -32,12 +42,6 @@ Broadcaster is a high-performance network broadcast service built with io_uring,
 - Focus on zero-copy and efficient memory management patterns
 - Leverage modern io_uring features for extreme performance
 - The service implements Redis Sharded Pub/Sub protocol for compatibility with Redis clients
-
-**Next Steps**:
-1. Create RAII wrappers for socket file descriptors
-2. Create RAII wrapper for io_uring ring
-3. Implement multishot accept for efficient connection handling
-4. Add receive/send operations with buffer management
 
 ## Development Environment
 

@@ -14,5 +14,4 @@ add_executable(broadcaster
     src/main.cpp
 )
 
-# liburing will be linked when RAII wrappers are implemented
-# target_link_libraries(broadcaster PRIVATE uring)
+target_link_libraries(broadcaster PRIVATE uring)
