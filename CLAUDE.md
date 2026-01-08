@@ -4,7 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Broadcaster is a high-performance network broadcast service built with io_uring, supporting the Redis Sharded Pub/Sub protocol.
+Broadcaster 是一个高性能的 TCP 流广播服务，设计目标：
+
+- **单发送者**: 一个 TCP 连接作为数据源
+- **多接收者**: 最多 16 个接收者同时接收数据
+- **原样转发**: 发送者的 TCP 流原封不动地广播给所有接收者
+- **动态加入**: 接收者可随时加入/退出，只接收加入后的数据
+- **落后断开**: 当接收者处理速度落后时，主动断开连接
+- **性能目标**: 单线程模式下达到 40Gbps 吞吐量
+
+## Documentation
+
+- **ARCHITECTURE.md**: 详细架构设计文档
+- **DEVELOPMENT_ROADMAP.md**: 开发规划与阶段任务
+- **PROTOCOL_DESIGN.md**: COBS 协议设计（用于消息边界识别）
 
 ## Current Status
 
@@ -22,13 +35,10 @@ Broadcaster is a high-performance network broadcast service built with io_uring,
 - `IoUring` class: io_uring ring wrapper (non-copyable, non-movable)
 - Simple "Hello, World!" TCP server for testing
 
-**Next Phase**: Production features
-- Implement multishot accept for efficient connection handling
-- Add receive operations (IORING_OP_RECV)
-- Buffer management with provided buffers
-- Zero-copy optimizations
-
-**Protocol Design**: COBS encoding documented in PROTOCOL_DESIGN.md
+**Next Phase** (Phase 3): Core Broadcasting Features
+- ConnectionManager: 连接角色分配与管理
+- RingBuffer: 256MB 环形缓冲区
+- Basic broadcast logic: 从发送者接收，广播到所有接收者
 
 ## Implementation Strategy
 
@@ -38,11 +48,53 @@ Broadcaster is a high-performance network broadcast service built with io_uring,
 - **Why liburing**: Full access to advanced features (multishot accept/recv, provided buffers, zero-copy)
 
 **Architecture Principles**:
-- Use C++ RAII to manage Linux resources (socket fd, io_uring ring, buffers)
-- Focus on zero-copy and efficient memory management patterns
-- Leverage modern io_uring features for extreme performance
-- The service implements Redis Sharded Pub/Sub protocol for compatibility with Redis clients
+- 单线程模式，充分利用 io_uring 异步能力
+- C++ RAII 管理 Linux 资源 (socket fd, io_uring ring, buffers)
+- 零拷贝传输：provided buffers (接收) + send_zc (发送)
+- 环形缓冲区存储待广播数据，支持多接收者独立读取位置
+- 背压控制：落后接收者自动断开
+
+**Performance Targets**:
+- 40 Gbps total throughput (sender + 16 receivers)
+- Single-threaded operation
+- < 1ms latency (P99)
+
+## Build Commands
+
+```bash
+# Configure
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+# Build
+cmake --build build
+
+# Run
+./build/broadcaster
+```
 
 ## Development Environment
 
-The project is intended to be developed on Linux systems (io_uring requires Linux kernel 5.1+).
+- **OS**: Linux (kernel 6.1+ recommended for all io_uring features)
+- **Compiler**: Clang with C++23 support
+- **Dependencies**: liburing
+
+## Key Design Decisions
+
+1. **Single-threaded**: io_uring can saturate network with single thread
+2. **Ring buffer size**: 256MB (allows ~50ms lag at 40Gbps)
+3. **First connection becomes sender**: Simple role assignment
+4. **Zero-copy everywhere**: provided buffers + send_zc
+
+## File Structure (Planned)
+
+```
+src/
+├── main.cpp                 # Entry point
+├── broadcaster.hpp/cpp      # Main broadcaster class
+├── io_uring_wrapper.hpp/cpp # io_uring RAII wrapper
+├── socket.hpp/cpp           # Socket RAII wrapper
+├── ring_buffer.hpp/cpp      # Ring buffer implementation
+├── connection_manager.hpp/cpp # Connection management
+├── buffer_ring.hpp/cpp      # Provided buffers
+└── backpressure.hpp/cpp     # Backpressure control
+```
