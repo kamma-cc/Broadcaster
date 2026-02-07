@@ -24,9 +24,12 @@ Broadcaster 是一个高性能的 TCP 流广播服务，设计目标是在单线
 
 - **单发送者**: 一个 TCP 连接作为数据源
 - **多接收者**: 最多 16 个接收者同时接收数据
+- **双端口接入**: Sender 与 Receiver 使用独立监听端口
 - **原样转发**: 发送者的 TCP 流原封不动地广播给所有接收者
+- **零修改原则**: Broadcaster 不做编码/解码/重分帧/重排
 - **动态加入**: 接收者可随时加入/退出，只接收加入后的数据
 - **落后断开**: 当接收者处理速度落后时，主动断开连接
+- **无接收者排空**: 当没有接收者时，继续读取发送者并丢弃数据
 
 ### 1.2 性能目标
 
@@ -87,14 +90,14 @@ class SenderManager {
     bool has_sender_ = false;        // 是否已有发送者
 
 public:
-    // 处理新连接：如果没有发送者，设为发送者；否则设为接收者
-    ConnectionRole assign_role(int fd);
+    // 来自 sender_port 的连接绑定为发送者（若已存在发送者则返回 false）
+    bool attach_sender(int fd);
 
     // 检查发送者是否存在
     bool has_sender() const;
 
     // 发送者断开时调用
-    void on_sender_disconnect();
+    void detach_sender();
 };
 ```
 
@@ -109,6 +112,7 @@ class ReceiverManager {
         size_t read_position;        // 在环形缓冲区中的读取位置
         size_t pending_bytes;        // 待发送字节数
         bool send_in_progress;       // 是否有发送操作进行中
+        uint64_t last_progress_ns;   // 最近一次发送推进时间
     };
 
     std::array<ReceiverState, MAX_RECEIVERS> receivers_;
@@ -154,22 +158,31 @@ public:
 
 ```cpp
 class BackpressureController {
-    size_t max_lag_bytes_;           // 最大允许落后字节数
+    struct Config {
+        size_t soft_lag_bytes = 32ULL * 1024 * 1024;
+        size_t hard_lag_bytes = 96ULL * 1024 * 1024;
+        uint32_t kick_grace_ms = 500;
+        uint8_t pause_watermark_pct = 80;
+        uint8_t resume_watermark_pct = 55;
+        size_t recv_chunk_bytes = 64 * 1024;
+    } cfg_;
 
 public:
-    // 检查接收者是否落后
-    bool should_disconnect(size_t receiver_pos, size_t write_pos) const;
-
-    // 计算落后程度
-    size_t get_lag(size_t receiver_pos, size_t write_pos) const;
+    // Receiver 级：是否判定为慢连接
+    bool is_slow(size_t lag_bytes) const;
+    // Receiver 级：是否需要断开（硬阈值 + 宽限期）
+    bool should_disconnect(size_t lag_bytes, uint32_t no_progress_ms) const;
+    // Global 级：是否暂停/恢复 Sender recv（带滞回）
+    bool should_pause_recv(size_t used_bytes, size_t capacity, size_t free_bytes) const;
+    bool should_resume_recv(size_t used_bytes, size_t capacity, size_t free_bytes) const;
 };
 ```
 
-### 2.3 连接角色识别
+### 2.3 连接角色识别（双端口）
 
 由于需要区分发送者和接收者，采用以下策略：
 
-**方案: 首连接为发送者**
+**方案: 双监听端口**
 
 ```cpp
 enum class ConnectionRole {
@@ -177,8 +190,12 @@ enum class ConnectionRole {
     Receiver    // 接收者：数据消费者
 };
 
-// 第一个连接成为发送者，后续连接成为接收者
-// 发送者断开后，下一个新连接成为发送者
+constexpr uint16_t SENDER_PORT = 7000;
+constexpr uint16_t RECEIVER_PORT = 7001;
+
+// sender_port: 只接受 Sender，且同一时刻仅允许一个 Sender
+// receiver_port: 只接受 Receiver
+// Sender 断开后不做角色重分配，等待新的 Sender 连接 sender_port
 ```
 
 ## 3. io_uring 高级特性应用
@@ -188,12 +205,14 @@ enum class ConnectionRole {
 使用多次触发的 accept 操作，避免每次接受连接后重新提交：
 
 ```cpp
-void submit_multishot_accept(IoUring& ring, int listen_fd) {
+void submit_multishot_accept(IoUring& ring, int listen_fd, ListenType type) {
     io_uring_sqe* sqe = ring.get_sqe();
     io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, 0);
-    io_uring_sqe_set_data(sqe, &accept_op);
+    io_uring_sqe_set_data(sqe, make_accept_op(type));
 }
 ```
+
+启动时分别为 `sender_port` 与 `receiver_port` 提交 accept。
 
 ### 3.2 Provided Buffers (提供的缓冲区)
 
@@ -253,10 +272,10 @@ public:
 
 ## 4. 数据流设计
 
-### 4.1 接收流程 (从发送者)
+### 4.1 BroadcastMode：有接收者时的数据流
 
 ```
-发送者 TCP 数据
+Sender socket bytes
        │
        ▼
 ┌─────────────────┐
@@ -265,17 +284,34 @@ public:
          │
          ▼
 ┌─────────────────┐
-│   Ring Buffer   │──► 写入位置更新
+│   Ring Buffer   │──► write_pos 递增
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│ 触发所有接收者  │
-│   的发送操作    │
+│ 调度 Receiver   │
+│ send/send_zc    │
 └─────────────────┘
 ```
 
-### 4.2 发送流程 (到接收者)
+### 4.2 DrainMode：无接收者时的数据流
+
+```
+Sender socket bytes
+       │
+       ▼
+┌─────────────────┐
+│  io_uring recv  │
+└────────┬────────┘
+         │
+         ▼
+┌────────────────────────────┐
+│ 直接丢弃 payload（不入 ring）│
+│ bytes_dropped_no_receiver++ │
+└────────────────────────────┘
+```
+
+### 4.3 发送流程 (到接收者)
 
 ```
 ┌─────────────────┐
@@ -298,10 +334,13 @@ public:
 └─────────────────┘
 ```
 
-### 4.3 完整事件循环
+### 4.4 完整事件循环
 
 ```cpp
-void event_loop(IoUring& ring, int listen_fd) {
+void event_loop(IoUring& ring, int sender_listen_fd, int receiver_listen_fd) {
+    submit_multishot_accept(ring, sender_listen_fd, ListenType::SenderListen);
+    submit_multishot_accept(ring, receiver_listen_fd, ListenType::ReceiverListen);
+
     while (running) {
         // 批量获取完成事件
         io_uring_cqe* cqes[BATCH_SIZE];
@@ -317,51 +356,109 @@ void event_loop(IoUring& ring, int listen_fd) {
         if (count == 0) {
             io_uring_wait_cqe(&ring, &cqe);
         }
+
+        if (receiver_manager.active_count() == 0) {
+            enter_drain_mode();      // 持续 recv 并丢弃
+        } else {
+            enter_broadcast_mode();  // 写 ring 并广播
+        }
     }
 }
 ```
 
 ## 5. 背压与落后处理
 
-### 5.1 落后检测策略
+### 5.1 设计原则
+
+- **不改数据**：只做字节搬运，不做编解码与重排。
+- **Receiver 优先治理**：优先识别并断开慢接收者，避免拖垮整体。
+- **Global 水位控制**：RingBuffer 高水位暂停 Sender `recv`，低水位恢复（滞回防抖）。
+- **无 Receiver 排空**：当接收者数量为 0 时持续读取并丢弃，不写入 RingBuffer。
+
+### 5.2 核心指标定义
 
 ```cpp
-constexpr size_t MAX_LAG_BYTES = 64 * 1024 * 1024;  // 64MB
+// 单调位置指针
+size_t write_pos;     // RingBuffer 全局写入位置
+size_t read_pos_i;    // Receiver i 的读取位置
 
-bool check_receiver_lag(const ReceiverState& receiver,
-                        size_t write_pos) {
-    size_t lag = write_pos - receiver.read_position;
+// 每个 Receiver 的落后量
+size_t lag_i = write_pos - read_pos_i;
 
-    if (lag > MAX_LAG_BYTES) {
-        // 接收者落后太多，需要断开
-        return true;
+// 全局占用量（最慢 Receiver 决定）
+size_t min_read_pos = min(read_pos_i for all active receivers);
+size_t used_bytes = write_pos - min_read_pos;
+size_t free_bytes = capacity - used_bytes;
+```
+
+### 5.3 可配置参数与默认值
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `soft_lag_bytes` | 32MB | 超过后标记慢连接 |
+| `hard_lag_bytes` | 96MB | 超过后进入断开候选 |
+| `kick_grace_ms` | 500ms | 超过硬阈值后允许的无进展窗口 |
+| `pause_watermark_pct` | 80 | 高水位，触发暂停 Sender recv |
+| `resume_watermark_pct` | 55 | 低水位，触发恢复 Sender recv |
+| `recv_chunk_bytes` | 64KB | 单次接收块大小（建议与 provided buffer 一致） |
+
+所有参数均支持配置覆盖。
+
+### 5.4 Receiver 级策略（慢连接治理）
+
+```cpp
+if (lag_i <= soft_lag_bytes) {
+    state = Healthy;
+} else if (lag_i <= hard_lag_bytes) {
+    state = Slow;
+} else {
+    // lag_i > hard_lag_bytes
+    // 只有持续 no-progress 超过宽限期才断开
+    if (no_progress_ms_i > kick_grace_ms) {
+        disconnect(receiver_i);
     }
-    return false;
 }
 ```
 
-### 5.2 断开落后接收者
+### 5.5 Global 级策略（Sender 回压）
 
 ```cpp
-void disconnect_lagging_receiver(IoUring& ring, int fd) {
-    // 提交异步 close 操作
-    io_uring_sqe* sqe = ring.get_sqe();
-    io_uring_prep_close(sqe, fd);
-    io_uring_sqe_set_data(sqe, make_close_op(fd));
+bool should_pause =
+    used_bytes >= capacity * pause_watermark_pct / 100 ||
+    free_bytes < recv_chunk_bytes;
 
-    // 从接收者列表中移除
-    receiver_manager.remove_receiver(fd);
+bool should_resume =
+    used_bytes <= capacity * resume_watermark_pct / 100 &&
+    free_bytes >= 2 * recv_chunk_bytes;
+```
+
+- 进入 `pause` 后，不再重提 Sender `recv` SQE。
+- 进入 `resume` 后，重新提交 Sender `recv`。
+- `pause`/`resume` 使用不同阈值，避免频繁抖动切换。
+
+### 5.6 无接收者排空策略（DrainMode）
+
+```cpp
+if (receiver_count == 0) {
+    // 继续从 Sender 读取，但不进入 RingBuffer
+    bytes_dropped_no_receiver += recv_len;
+    rearm_sender_recv();
+    return;
 }
 ```
 
-### 5.3 环形缓冲区大小考量
+用途：
+- 保持 Sender 可持续发送，不因无 Receiver 被阻塞。
+- 明确语义：无 Receiver 时的数据不会缓存或回放给后续 Receiver。
+
+### 5.7 环形缓冲区大小考量
 
 ```
-缓冲区大小建议：256MB
+缓冲区建议：256MB（可配置）
 
 计算依据：
 - 目标吞吐量：40 Gbps ≈ 5 GB/s
-- 允许最大延迟：~50ms
+- 允许吸收抖动窗口：~50ms
 - 所需缓冲区：5 GB/s × 0.05s = 256 MB
 ```
 
@@ -403,8 +500,9 @@ struct ReceiverState {
     uint32_t flags;            // 4 bytes
     size_t read_position;      // 8 bytes
     size_t pending_bytes;      // 8 bytes
+    uint64_t last_progress_ns; // 8 bytes
     // 填充到 64 字节以避免 false sharing
-    uint8_t padding[40];
+    uint8_t padding[32];
 };
 
 static_assert(sizeof(ReceiverState) == 64);
@@ -512,6 +610,7 @@ struct Metrics {
     // 吞吐量
     std::atomic<uint64_t> bytes_received;
     std::atomic<uint64_t> bytes_sent;
+    std::atomic<uint64_t> bytes_dropped_no_receiver;
 
     // 连接
     std::atomic<uint32_t> active_receivers;
@@ -525,6 +624,8 @@ struct Metrics {
     // 缓冲区
     std::atomic<size_t> ring_buffer_used;
     std::atomic<size_t> max_receiver_lag;
+    std::atomic<uint64_t> sender_recv_pause_count;
+    std::atomic<uint64_t> sender_recv_pause_ns;
 };
 ```
 
@@ -547,7 +648,7 @@ void print_stats(const Metrics& m, double elapsed_sec) {
 ### 10.1 未来可能的扩展
 
 1. **多发送者支持**: 允许多个发送者，合并数据流
-2. **消息分帧**: 使用 COBS 协议支持消息边界
+2. **消息分帧**: 在客户端/网关侧使用 COBS 协议支持消息边界
 3. **过滤/路由**: 基于内容的选择性广播
 4. **持久化**: 将数据流写入磁盘供回放
 

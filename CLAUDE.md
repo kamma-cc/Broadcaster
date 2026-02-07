@@ -8,8 +8,10 @@ Broadcaster 是一个高性能的 TCP 流广播服务，设计目标：
 
 - **单发送者**: 一个 TCP 连接作为数据源
 - **多接收者**: 最多 16 个接收者同时接收数据
+- **双端口接入**: Sender 与 Receiver 使用独立监听端口
 - **原样转发**: 发送者的 TCP 流原封不动地广播给所有接收者
 - **动态加入**: 接收者可随时加入/退出，只接收加入后的数据
+- **无接收者排空**: 无接收者时继续读取发送者并丢弃
 - **落后断开**: 当接收者处理速度落后时，主动断开连接
 - **性能目标**: 单线程模式下达到 40Gbps 吞吐量
 
@@ -36,9 +38,9 @@ Broadcaster 是一个高性能的 TCP 流广播服务，设计目标：
 - Simple "Hello, World!" TCP server for testing
 
 **Next Phase** (Phase 3): Core Broadcasting Features
-- ConnectionManager: 连接角色分配与管理
+- ConnectionManager: 双端口连接管理（sender_port/receiver_port）
 - RingBuffer: 256MB 环形缓冲区
-- Basic broadcast logic: 从发送者接收，广播到所有接收者
+- Basic broadcast logic: 从发送者接收，广播到所有接收者（无接收者时排空丢弃）
 
 ## Implementation Strategy
 
@@ -82,7 +84,7 @@ cmake --build build
 
 1. **Single-threaded**: io_uring can saturate network with single thread
 2. **Ring buffer size**: 256MB (allows ~50ms lag at 40Gbps)
-3. **First connection becomes sender**: Simple role assignment
+3. **Dual-port role separation**: sender_port for sender, receiver_port for receivers
 4. **Zero-copy everywhere**: provided buffers + send_zc
 
 ## File Structure (Planned)
